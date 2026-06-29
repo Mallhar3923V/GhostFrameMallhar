@@ -1,110 +1,123 @@
-import os
-import json
-import subprocess
+from contextlib import asynccontextmanager
+from pathlib import Path
+from threading import Lock
+from time import time
+from uuid import uuid4
+
 from fastapi import FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
-app = FastAPI(title="GhostFrame Engineering Engine")
+from engine.zimage_turbo import generate_image, load_pipeline
 
-# Enable CORS cross-origin requests so Swati's frontend files can run safely from any local server context
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+pipeline = None
+pipeline_lock = Lock()
+
+
+class GenerationRequest(BaseModel):
+    prompt: str
+    style: str = ""
+
+
+def build_prompt(prompt: str, style: str) -> str:
+    clean_prompt = prompt.strip()
+    clean_style = style.strip()
+
+    if not clean_style:
+        return clean_prompt
+
+    return f"{clean_prompt}, {clean_style} style"
+
+
+def create_output_path() -> Path:
+    filename = f"generation_{int(time())}_{uuid4().hex[:8]}.png"
+    return OUTPUT_DIR / filename
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global pipeline
+    pipeline = load_pipeline()
+    yield
+
+
+app = FastAPI(title="GhostFrame Image Generation API", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Application absolute pathing matrix mapping straight to your setup
-BASE_DIR = "/teamspace/studios/this_studio/GhostFrame"
-IDEOGRAM_DIR = os.path.join(BASE_DIR, "ideogram4")
-OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
-# Ensure structural output paths exist safely
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Mount directory to automatically turn files into clean web-accessible URLs
-app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"status": "error", "message": exc.detail},
+    )
 
-class GenerationRequest(BaseModel):
-    prompt: str
-    style: str
 
-def compile_asymmetric_prompt(user_prompt: str, style_modifier: str) -> str:
-    """
-    Formulates text vectors directly into the exact nested JSON architecture 
-    required for Ideogram 4.0 Inference while applying frontend visual styles.
-    """
-    payload = {
-        "high_level_description": f"{user_prompt}, {style_modifier} style",
-        "compositional_deconstruction": {
-            "background": f"{user_prompt}, high quality streaming asset, background frame layer",
-            "elements": [
-                {"type": "obj", "desc": f"stylized elements matched to {style_modifier} theme"}
-            ]
-        }
-    }
-    return json.dumps(payload)
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=422,
+        content={"status": "error", "message": "Invalid request body."},
+    )
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "model_loaded": pipeline is not None}
+
 
 @app.post("/generate")
-async def process_generation(payload: GenerationRequest):
+async def generate(payload: GenerationRequest):
     if not payload.prompt.strip():
-        raise HTTPException(status_code=400, detail="Null prompt telemetry received.")
-    
-    target_filename = "stream_output.png"
-    target_filepath = os.path.join(OUTPUT_DIR, target_filename)
-    
-    # Structure the prompt parameters according to backend requirements
-    final_prompt = compile_asymmetric_prompt(payload.prompt, payload.style)
-    
-    # Map the exact parameters that successfully generated your proof-of-concept image
-    execution_cmd = [
-        "python", "run_inference.py",
-        "--prompt", final_prompt,
-        "--no-magic-prompt",
-        "--output", target_filepath,
-        "--quantization", "nf4",
-        "--sampler-preset", "V4_DEFAULT_20",
-        "--seed", "42"
-    ]
-    
-    print(f"[ENGINE] Launching Ideogram 4.0 Subprocess pipeline in directory: {IDEOGRAM_DIR}")
-    
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Model is still loading. Try again shortly.")
+
+    output_path = create_output_path()
+    final_prompt = build_prompt(payload.prompt, payload.style)
+
+    def run_generation():
+        with pipeline_lock:
+            return generate_image(pipeline, final_prompt, output_path)
+
     try:
-        # Run the conditional-only inference pipeline directly on your cloud hardware
-        result = subprocess.run(
-            execution_cmd,
-            cwd=IDEOGRAM_DIR,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True
+        metrics = await run_in_threadpool(run_generation)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
+
+    if not output_path.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="Inference finished, but the output image was not saved.",
         )
-        
-        if not os.path.exists(target_filepath):
-            raise HTTPException(status_code=500, detail="Inference finished, but payload missing from filesystem.")
-        
-        # Calculate dynamic file modification Unix timestamp to bypass browser cache issues
-        cache_buster = int(os.path.getmtime(target_filepath))
-        
-        return {
-            "status": "success",
-            "image_url": f"http://localhost:8000/outputs/{target_filename}?v={cache_buster}",
-            "metadata": {
-                "scene": "Stream Asset Container",
-                "lighting": "Studio Dynamic Array"
-            }
-        }
-        
-    except subprocess.CalledProcessError as err:
-        print(f"[ENGINE ERROR] Standard Error log from inference run:\n{err.stderr}")
-        raise HTTPException(status_code=500, detail=f"Inference Engine Crash: {err.stderr[:250]}")
-    except Exception as general_err:
-        raise HTTPException(status_code=500, detail=str(general_err))
+
+    return {
+        "status": "success",
+        "filename": output_path.name,
+        "metrics": metrics,
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
-    # Serves the engine over port 8000
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
